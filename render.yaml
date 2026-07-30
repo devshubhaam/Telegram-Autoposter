@@ -1,0 +1,6 @@
+services:
+  - type: worker
+    name: telegram-auto-posting-bot
+    runtime: docker
+    plan: starter
+    autoDeploy: true
