@@ -343,6 +343,12 @@ class Database:
             },
         )
 
+    async def delete_chat(self, chat_id: int) -> None:
+        await self.posts_coll(chat_id).drop()
+        await self.history_coll(chat_id).drop()
+        await self.chats.delete_one({"chat_id": chat_id})
+        await self.admins.update_many({"target_chat_id": chat_id}, {"$set": {"target_chat_id": None}})
+
     async def wipe_all(self) -> None:
         chats = await self.list_chats()
         for chat in chats:
@@ -750,7 +756,8 @@ async def chat_keyboard(chat_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("↩️ Undo last post", callback_data=f"chat:undo:{chat_id}"), InlineKeyboardButton("🧹 Wipe this channel", callback_data=f"chat:wipe:{chat_id}")],
             [InlineKeyboardButton("📌 Send & Pin Prompt", callback_data=f"chat:promo:{chat_id}")],
             [InlineKeyboardButton("🔒 Force-Sub Gate", callback_data=f"chat:forcesub:{chat_id}")],
-            [InlineKeyboardButton("⏸ Pause" if active else "▶️ Resume", callback_data=f"chat:toggle:{chat_id}"), InlineKeyboardButton("⬅️ Targets", callback_data="nav:targets")],
+            [InlineKeyboardButton("⏸ Pause" if active else "▶️ Resume", callback_data=f"chat:toggle:{chat_id}"), InlineKeyboardButton("🗑 Remove channel/group", callback_data=f"chat:remove:{chat_id}")],
+            [InlineKeyboardButton("⬅️ Targets", callback_data="nav:targets")],
         ]
     )
 
@@ -1497,6 +1504,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif action == "wipeconfirm":
         await STATE.db.wipe_chat(chat_id)
         await query.edit_message_text(await render_chat_overview(chat_id) + "\n\n✅ Posts wiped for this channel.", reply_markup=await chat_keyboard(chat_id), parse_mode="HTML")
+    elif action == "remove":
+        chat = await STATE.db.get_chat(chat_id)
+        title = html.escape(chat.get("title", str(chat_id))) if chat else str(chat_id)
+        text = (
+            f"🗑 <b>Remove {title} from the bot?</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "This removes the channel/group entirely from the target list — its posts, history, "
+            "schedule, and queue are all deleted. The bot will stop auto-posting there. "
+            "The bot itself stays in the channel/group unless you also remove it there manually. "
+            "This cannot be undone."
+        )
+        await query.edit_message_text(text, reply_markup=confirm_keyboard(f"chat:removeconfirm:{chat_id}", f"chat:open:{chat_id}", "🗑 Yes, remove it"), parse_mode="HTML")
+    elif action == "removeconfirm":
+        chat = await STATE.db.get_chat(chat_id)
+        title = html.escape(chat.get("title", str(chat_id))) if chat else str(chat_id)
+        await STATE.db.delete_chat(chat_id)
+        await query.edit_message_text(
+            f"✅ <b>{title}</b> has been removed from the bot's target list.",
+            reply_markup=await targets_keyboard(),
+            parse_mode="HTML",
+        )
     elif action == "promo":
         chat = await STATE.db.get_chat(chat_id)
         title = html.escape(chat.get("title", str(chat_id))) if chat else str(chat_id)
