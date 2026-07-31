@@ -1311,6 +1311,14 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(text, parse_mode="HTML")
 
 
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id if user else None):
+        return
+    await clear_admin_mode(user.id)
+    await update.effective_message.reply_text("❌ Cancelled. Any in-progress action (password, import, etc.) has been stopped.")
+
+
 async def register_current_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not is_admin(user.id if user else None):
@@ -1788,11 +1796,6 @@ async def private_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
     admin_state = await admin_doc(user.id)
     mode = admin_state.get("mode")
 
-    if mode and message.text and message.text.strip().lower() == "/cancel":
-        await clear_admin_mode(user.id)
-        await message.reply_text("❌ Cancelled.")
-        return
-
     if mode == "await_password":
         deadline = admin_state.get("password_deadline")
         if deadline is not None and deadline.tzinfo is None:
@@ -2110,6 +2113,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("register", register_current_chat))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
