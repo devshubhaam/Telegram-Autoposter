@@ -55,6 +55,8 @@ class Settings:
     scheduler_lock_seconds: int
     retry_attempts: int
     retry_base_seconds: float
+    admin_password: str | None = None
+    password_timeout_seconds: int = 300
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -84,6 +86,8 @@ class Settings:
             scheduler_lock_seconds=int(os.getenv("SCHEDULER_LOCK_SECONDS", "300")),
             retry_attempts=int(os.getenv("RETRY_ATTEMPTS", "3")),
             retry_base_seconds=float(os.getenv("RETRY_BASE_SECONDS", "2")),
+            admin_password=(os.getenv("ADMIN_PASSWORD", "").strip() or None),
+            password_timeout_seconds=int(os.getenv("PASSWORD_TIMEOUT_SECONDS", "300")),
         )
 
 
@@ -117,6 +121,18 @@ def parse_days(value: str) -> list[int]:
     if not result or any(day not in range(7) for day in result):
         raise ValueError("Days must be comma separated weekday numbers 0-6")
     return result
+
+
+def parse_post_link_or_id(value: str) -> int | None:
+    value = (value or "").strip().split("?", 1)[0].rstrip("/")
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+    parts = [p for p in value.split("/") if p]
+    if parts and parts[-1].isdigit():
+        return int(parts[-1])
+    return None
 
 
 def day_labels(days: Iterable[int]) -> str:
@@ -1075,6 +1091,15 @@ def settings_keyboard() -> InlineKeyboardMarkup:
 
 async def send_saved_post(bot, target_chat_id: int, post: dict[str, Any]) -> int:
     media_type = post.get("media_type", "text")
+    if media_type == "forward":
+        msg = await bot.copy_message(
+            chat_id=target_chat_id,
+            from_chat_id=post["source_chat_id"],
+            message_id=post["source_message_id"],
+            disable_notification=bool(post.get("silent", False)),
+            protect_content=bool(post.get("protect_content", False)),
+        )
+        return msg.message_id
     if media_type == "album":
         items = post.get("media_group", [])
         input_media = []
@@ -1330,6 +1355,54 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass  # user hasn't started the bot privately; can't DM them
 
 
+async def run_dangerous_action(action: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Executes a confirmed destructive action (wipe/remove) and returns text+keyboard to show."""
+    if action == "db:wipeconfirm":
+        await STATE.db.wipe_all()
+        return (
+            "✅ Database wiped. Bot is now in a fresh state.\n\nUse 🧭 Targets to add channels/groups again.",
+            dashboard_keyboard(),
+        )
+    parts = action.split(":")
+    if len(parts) == 3 and parts[0] == "chat":
+        chat_id = int(parts[2])
+        if parts[1] == "wipeconfirm":
+            await STATE.db.wipe_chat(chat_id)
+            return (
+                (await render_chat_overview(chat_id)) + "\n\n✅ Posts wiped for this channel.",
+                await chat_keyboard(chat_id),
+            )
+        if parts[1] == "removeconfirm":
+            chat = await STATE.db.get_chat(chat_id)
+            title = html.escape(chat.get("title", str(chat_id))) if chat else str(chat_id)
+            await STATE.db.delete_chat(chat_id)
+            return (
+                f"✅ <b>{title}</b> has been removed from the bot's target list.",
+                await targets_keyboard(),
+            )
+    return "⚠️ Unknown or expired action.", dashboard_keyboard()
+
+
+async def handle_dangerous_confirm(action: str, query, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Gates a destructive action behind ADMIN_PASSWORD if one is configured, otherwise runs it directly."""
+    if SETTINGS.admin_password:
+        await set_admin_meta(
+            user_id,
+            mode="await_password",
+            pending_action=action,
+            password_deadline=utcnow() + timedelta(seconds=SETTINGS.password_timeout_seconds),
+        )
+        await query.edit_message_text(
+            "🔑 <b>Password required</b>\n━━━━━━━━━━━━━━━━━━\n"
+            "This is a destructive action. Reply here (in this private chat) with the admin "
+            "password to confirm, or send /cancel to abort.\nYour password message will be deleted automatically.",
+            parse_mode="HTML",
+        )
+        return
+    text, kb = await run_dangerous_action(action)
+    await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = query.from_user
@@ -1357,6 +1430,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         chat = await STATE.db.get_chat(chat_id)
         title = html.escape(chat.get("title", str(chat_id))) if chat else str(chat_id)
         await STATE.db.set_active_target(user.id, chat_id)
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📝 Manual Upload", callback_data=f"up:manual:{chat_id}")],
+                [InlineKeyboardButton("📥 Import Range from Channel", callback_data=f"up:import:{chat_id}")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="nav:upload")],
+            ]
+        )
+        await query.edit_message_text(
+            f"⬆️ <b>Upload target: {title}</b>\nChoose how you want to add posts.",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        return
+    if data.startswith("up:manual:"):
+        chat_id = int(data.split(":")[2])
+        chat = await STATE.db.get_chat(chat_id)
+        title = html.escape(chat.get("title", str(chat_id))) if chat else str(chat_id)
+        await STATE.db.set_active_target(user.id, chat_id)
         await set_admin_meta(user.id, mode="bulk_upload", mode_chat_id=chat_id, upload_count=0)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Finish Upload", callback_data="up:finish")]])
         sent = await context.bot.send_message(
@@ -1366,6 +1457,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=kb,
         )
         await set_admin_meta(user.id, upload_msg_id=sent.message_id)
+        return
+    if data.startswith("up:import:"):
+        chat_id = int(data.split(":")[2])
+        chat = await STATE.db.get_chat(chat_id)
+        title = html.escape(chat.get("title", str(chat_id))) if chat else str(chat_id)
+        await STATE.db.set_active_target(user.id, chat_id)
+        await set_admin_meta(user.id, mode="import_source", mode_chat_id=chat_id)
+        await context.bot.send_message(
+            query.message.chat_id,
+            (
+                f"📥 <b>Import posts into {title}</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "Step 1 of 3 — Forward any message from the SOURCE channel (the one that already "
+                "has the posts), or send its @username / -100 numeric ID.\n\n"
+                "⚠️ The bot must be an admin in the source channel to read/copy its posts.\n"
+                "Send /cancel to abort."
+            ),
+            parse_mode="HTML",
+        )
         return
     if data == "up:finish":
         admin_state = await admin_doc(user.id)
@@ -1394,8 +1504,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(text, reply_markup=confirm_keyboard("db:wipeconfirm", "nav:database", "🧨 Yes, wipe everything"), parse_mode="HTML")
         return
     if data == "db:wipeconfirm":
-        await STATE.db.wipe_all()
-        await query.edit_message_text("✅ Database wiped. Bot is now in a fresh state.\n\nUse 🧭 Targets to add channels/groups again.", reply_markup=dashboard_keyboard(), parse_mode="HTML")
+        await handle_dangerous_confirm(data, query, context, user.id)
         return
     if data == "nav:backup":
         await query.edit_message_text(await render_backup_text(), reply_markup=backup_keyboard(), parse_mode="HTML")
@@ -1502,8 +1611,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         await query.edit_message_text(text, reply_markup=confirm_keyboard(f"chat:wipeconfirm:{chat_id}", f"chat:open:{chat_id}", "🧹 Yes, wipe this channel"), parse_mode="HTML")
     elif action == "wipeconfirm":
-        await STATE.db.wipe_chat(chat_id)
-        await query.edit_message_text(await render_chat_overview(chat_id) + "\n\n✅ Posts wiped for this channel.", reply_markup=await chat_keyboard(chat_id), parse_mode="HTML")
+        await handle_dangerous_confirm(data, query, context, user.id)
     elif action == "remove":
         chat = await STATE.db.get_chat(chat_id)
         title = html.escape(chat.get("title", str(chat_id))) if chat else str(chat_id)
@@ -1517,14 +1625,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         await query.edit_message_text(text, reply_markup=confirm_keyboard(f"chat:removeconfirm:{chat_id}", f"chat:open:{chat_id}", "🗑 Yes, remove it"), parse_mode="HTML")
     elif action == "removeconfirm":
-        chat = await STATE.db.get_chat(chat_id)
-        title = html.escape(chat.get("title", str(chat_id))) if chat else str(chat_id)
-        await STATE.db.delete_chat(chat_id)
-        await query.edit_message_text(
-            f"✅ <b>{title}</b> has been removed from the bot's target list.",
-            reply_markup=await targets_keyboard(),
-            parse_mode="HTML",
-        )
+        await handle_dangerous_confirm(data, query, context, user.id)
     elif action == "promo":
         chat = await STATE.db.get_chat(chat_id)
         title = html.escape(chat.get("title", str(chat_id))) if chat else str(chat_id)
@@ -1677,6 +1778,116 @@ async def private_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
         return
     admin_state = await admin_doc(user.id)
     mode = admin_state.get("mode")
+
+    if mode and message.text and message.text.strip().lower() == "/cancel":
+        await clear_admin_mode(user.id)
+        await message.reply_text("❌ Cancelled.")
+        return
+
+    if mode == "await_password":
+        deadline = admin_state.get("password_deadline")
+        if deadline and utcnow() > deadline:
+            await clear_admin_mode(user.id)
+            await message.reply_text("⌛ Password prompt expired. Please start the action again.")
+            return
+        entered = (message.text or "").strip()
+        try:
+            await message.delete()
+        except (BadRequest, Forbidden):
+            pass
+        if not SETTINGS.admin_password or entered != SETTINGS.admin_password:
+            await message.reply_text("❌ Wrong password. Try again, or send /cancel to abort.")
+            return
+        pending_action = admin_state.get("pending_action", "")
+        await clear_admin_mode(user.id)
+        result_text, result_kb = await run_dangerous_action(pending_action)
+        await message.reply_text(result_text, reply_markup=result_kb, parse_mode="HTML")
+        return
+
+    if mode == "import_source":
+        target_chat_id = int(admin_state.get("mode_chat_id"))
+        source_chat_id: int | None = None
+        origin = getattr(message, "forward_origin", None)
+        if origin is not None:
+            origin_chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
+            if origin_chat is not None:
+                source_chat_id = origin_chat.id
+        if source_chat_id is None and getattr(message, "forward_from_chat", None):
+            source_chat_id = message.forward_from_chat.id
+        if source_chat_id is None and message.text:
+            raw = message.text.strip()
+            value: int | str = int(raw) if raw.lstrip("-").isdigit() else (raw if raw.startswith("@") else f"@{raw}")
+            try:
+                chat_obj = await context.bot.get_chat(value)
+                source_chat_id = chat_obj.id
+            except (BadRequest, Forbidden) as exc:
+                await message.reply_text(f"❌ Can't access that channel: {exc}\nMake sure the bot is an admin there, then try again, or /cancel.")
+                return
+        if source_chat_id is None:
+            await message.reply_text("Forward a message from the source channel, or send its @username / ID. Send /cancel to abort.")
+            return
+        await set_admin_meta(user.id, mode="import_from_link", mode_chat_id=target_chat_id, source_chat_id=source_chat_id)
+        await message.reply_text(
+            "🔗 Step 2 of 3 — Send the link (or plain message ID) of the FIRST post to import.\n"
+            "e.g. <code>https://t.me/channelusername/120</code> or just <code>120</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if mode == "import_from_link" and message.text:
+        from_id = parse_post_link_or_id(message.text)
+        if from_id is None:
+            await message.reply_text("Couldn't read that. Send a link like https://t.me/channel/120 or just the number 120, or /cancel.")
+            return
+        await set_admin_meta(user.id, from_message_id=from_id, mode="import_to_link")
+        await message.reply_text(
+            "🔗 Step 3 of 3 — Send the link (or plain message ID) of the LAST post to import.",
+        )
+        return
+
+    if mode == "import_to_link" and message.text:
+        to_id = parse_post_link_or_id(message.text)
+        if to_id is None:
+            await message.reply_text("Couldn't read that. Send a link like https://t.me/channel/130 or just the number 130, or /cancel.")
+            return
+        target_chat_id = int(admin_state.get("mode_chat_id"))
+        source_chat_id = int(admin_state.get("source_chat_id"))
+        from_id = int(admin_state.get("from_message_id"))
+        lo, hi = sorted((from_id, to_id))
+        total = hi - lo + 1
+        if total > 1000:
+            await message.reply_text(f"❌ Range too large ({total} posts). Please import in batches of 1000 or fewer, or /cancel.")
+            return
+        await clear_admin_mode(user.id)
+        status = await message.reply_text(f"⏳ Queuing {total} post(s) for import…")
+        for msg_id in range(lo, hi + 1):
+            payload = {
+                "media_type": "forward",
+                "source_chat_id": source_chat_id,
+                "source_message_id": msg_id,
+                "caption": None,
+                "silent": False,
+                "protect_content": False,
+                "buttons": [],
+            }
+            await STATE.db.add_post(target_chat_id, payload)
+        chat = await STATE.db.get_chat(target_chat_id)
+        queue = chat.get("queue_state", {}).get("queue", [])
+        cursor = int(chat.get("queue_state", {}).get("cursor", 0))
+        if not queue or cursor >= len(queue):
+            next_post_time = chat.get("next_post_time")
+            await STATE.db.rebuild_cycle(target_chat_id)
+            await STATE.db.chats.update_one({"chat_id": target_chat_id}, {"$set": {"next_post_time": next_post_time}})
+        title = html.escape(chat.get("title", str(target_chat_id))) if chat else str(target_chat_id)
+        await status.edit_text(
+            f"✅ Import queued into <b>{title}</b>\n"
+            f"📦 Posts added: <b>{total}</b>\n\n"
+            "They'll go out on this channel's normal posting schedule. Any deleted/invalid "
+            "message IDs in the range are skipped automatically when it's their turn to post.",
+            parse_mode="HTML",
+        )
+        return
+
     if mode == "restore_backup" and message.document:
         file = await context.bot.get_file(message.document.file_id)
         blob = await file.download_as_bytearray()
