@@ -1795,6 +1795,8 @@ async def private_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
 
     if mode == "await_password":
         deadline = admin_state.get("password_deadline")
+        if deadline is not None and deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
         if deadline and utcnow() > deadline:
             await clear_admin_mode(user.id)
             await message.reply_text("⌛ Password prompt expired. Please start the action again.")
@@ -2083,6 +2085,23 @@ def start_health_server() -> None:
     logging.getLogger(__name__).info("health_check_server_started", extra={"port": port})
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled exception while processing update", exc_info=context.error)
+    try:
+        await STATE.db.log("error", "unhandled_exception", error=str(context.error))
+    except Exception:  # noqa: BLE001 - never let error logging itself crash the handler
+        pass
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                f"⚠️ Something went wrong: <code>{html.escape(str(context.error))}</code>\nSend /start to reset.",
+                parse_mode="HTML",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def build_application() -> Application:
     app = Application.builder().token(SETTINGS.bot_token).build()
     app.post_init = on_startup
@@ -2096,6 +2115,7 @@ def build_application() -> Application:
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, private_admin_message))
     app.add_handler(MessageHandler(~filters.ChatType.PRIVATE & ~filters.COMMAND, any_chat_message))
+    app.add_error_handler(error_handler)
     return app
 
 
