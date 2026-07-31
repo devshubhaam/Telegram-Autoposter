@@ -1206,6 +1206,20 @@ async def send_post_with_retry(bot, target_chat_id: int, post: dict[str, Any]) -
     raise RuntimeError("send_post_with_retry failed without captured exception")
 
 
+async def rebuild_and_ensure_schedule(chat_id: int) -> dict[str, Any]:
+    """Rebuilds the post queue while keeping the existing next_post_time if it was
+    already valid. If it was missing/None (so the scheduler would never pick this
+    chat up), computes a fresh one from the current schedule instead of leaving it
+    stuck at None forever."""
+    current = await STATE.db.get_chat(chat_id) or {}
+    next_post_time = current.get("next_post_time")
+    await STATE.db.rebuild_cycle(chat_id)
+    if not next_post_time and current.get("is_active", True):
+        next_post_time = compute_next_run(utcnow(), current.get("schedule", {}))
+    await STATE.db.chats.update_one({"chat_id": chat_id}, {"$set": {"next_post_time": next_post_time, "updated_at": utcnow()}})
+    return await STATE.db.get_chat(chat_id)
+
+
 async def process_chat_batch(bot, chat_id: int, manual: bool = False) -> int:
     lock = STATE.lock_for(chat_id)
     async with lock:
@@ -1237,6 +1251,16 @@ async def process_chat_batch(bot, chat_id: int, manual: bool = False) -> int:
                     await STATE.db.advance_after_success(chat_id, post_id, telegram_message_id)
                     sent_count += 1
                 except Forbidden as exc:
+                    if post.get("media_type") == "forward":
+                        # The bot lost access to the SOURCE channel (deleted, or bot removed from it),
+                        # not the target. Skip only this imported post; the target channel stays active.
+                        await STATE.db.chats.update_one(
+                            {"chat_id": chat_id},
+                            {"$set": {"last_error": f"Import source unreachable, post skipped: {exc}", "updated_at": utcnow()}},
+                        )
+                        await STATE.db.log("warning", "import_post_skipped_source_gone", chat_id=chat_id, post_id=post_id, error=str(exc))
+                        await STATE.db.chats.update_one({"chat_id": chat_id}, {"$inc": {"queue_state.cursor": 1}})
+                        continue
                     await STATE.db.chats.update_one(
                         {"chat_id": chat_id},
                         {"$set": {"is_active": False, "next_post_time": None, "last_error": f"Forbidden: {exc}", "updated_at": utcnow()}},
@@ -1594,10 +1618,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await set_admin_meta(user.id, mode="edit_schedule", mode_chat_id=chat_id)
         await context.bot.send_message(query.message.chat_id, f"📝 Send the new schedule for {chat_id} using the format shown in the schedule panel.")
     elif action == "reshuffle":
-        current = await STATE.db.get_chat(chat_id)
-        next_post_time = current.get("next_post_time")
-        await STATE.db.rebuild_cycle(chat_id)
-        await STATE.db.chats.update_one({"chat_id": chat_id}, {"$set": {"next_post_time": next_post_time, "updated_at": utcnow()}})
+        await rebuild_and_ensure_schedule(chat_id)
         await query.edit_message_text(await render_queue_text(chat_id), reply_markup=await chat_keyboard(chat_id), parse_mode="HTML")
     elif action == "run":
         sent = await process_chat_batch(context.bot, chat_id, manual=True)
@@ -1751,9 +1772,7 @@ async def flush_media_group(context: ContextTypes.DEFAULT_TYPE) -> None:
     queue = chat.get("queue_state", {}).get("queue", [])
     cursor = int(chat.get("queue_state", {}).get("cursor", 0))
     if not queue or cursor >= len(queue):
-        next_post_time = chat.get("next_post_time")
-        await STATE.db.rebuild_cycle(chat_id)
-        await STATE.db.chats.update_one({"chat_id": chat_id}, {"$set": {"next_post_time": next_post_time}})
+        await rebuild_and_ensure_schedule(chat_id)
     admin_id = buf["admin_id"]
     admin_state = await admin_doc(admin_id)
     if admin_state.get("mode") == "bulk_upload" and admin_state.get("mode_chat_id") == chat_id:
@@ -1899,13 +1918,13 @@ async def private_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
         queue = chat.get("queue_state", {}).get("queue", [])
         cursor = int(chat.get("queue_state", {}).get("cursor", 0))
         if not queue or cursor >= len(queue):
-            next_post_time = chat.get("next_post_time")
-            await STATE.db.rebuild_cycle(target_chat_id)
-            await STATE.db.chats.update_one({"chat_id": target_chat_id}, {"$set": {"next_post_time": next_post_time}})
+            chat = await rebuild_and_ensure_schedule(target_chat_id)
         title = html.escape(chat.get("title", str(target_chat_id))) if chat else str(target_chat_id)
+        next_run_line = f"⏰ Next run: <b>{html.escape(format_dt(chat.get('next_post_time')))}</b>\n" if chat else ""
         await status.edit_text(
             f"✅ Import queued into <b>{title}</b>\n"
-            f"📦 Posts added: <b>{total}</b>\n\n"
+            f"📦 Posts added: <b>{total}</b>\n"
+            f"{next_run_line}\n"
             "They'll go out on this channel's normal posting schedule. Any deleted/invalid "
             "message IDs in the range are skipped automatically when it's their turn to post.",
             parse_mode="HTML",
@@ -1962,9 +1981,7 @@ async def private_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
             queue = chat.get("queue_state", {}).get("queue", [])
             cursor = int(chat.get("queue_state", {}).get("cursor", 0))
             if not queue or cursor >= len(queue):
-                next_post_time = chat.get("next_post_time")
-                await STATE.db.rebuild_cycle(target_chat_id)
-                await STATE.db.chats.update_one({"chat_id": target_chat_id}, {"$set": {"next_post_time": next_post_time}})
+                await rebuild_and_ensure_schedule(target_chat_id)
             await bump_upload_counter(user.id, context, message.chat_id, added=inserted)
             return
         payload = message_to_post_payload(message)
@@ -2010,9 +2027,7 @@ async def private_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
         queue = chat.get("queue_state", {}).get("queue", [])
         cursor = int(chat.get("queue_state", {}).get("cursor", 0))
         if not queue or cursor >= len(queue):
-            next_post_time = chat.get("next_post_time")
-            await STATE.db.rebuild_cycle(target["chat_id"])
-            await STATE.db.chats.update_one({"chat_id": target["chat_id"]}, {"$set": {"next_post_time": next_post_time}})
+            await rebuild_and_ensure_schedule(target["chat_id"])
         return
 
     payload = message_to_post_payload(message)
@@ -2022,9 +2037,7 @@ async def private_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
     queue = chat.get("queue_state", {}).get("queue", [])
     cursor = int(chat.get("queue_state", {}).get("cursor", 0))
     if not queue or cursor >= len(queue):
-        next_post_time = chat.get("next_post_time")
-        await STATE.db.rebuild_cycle(target["chat_id"])
-        await STATE.db.chats.update_one({"chat_id": target["chat_id"]}, {"$set": {"next_post_time": next_post_time}})
+        await rebuild_and_ensure_schedule(target["chat_id"])
 
 
 async def any_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
