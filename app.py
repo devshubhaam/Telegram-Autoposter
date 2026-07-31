@@ -305,8 +305,9 @@ class Database:
         await self.history_coll(chat_id).create_index([("posted_at", ASCENDING)])
         return doc
 
-    async def list_chats(self) -> list[dict[str, Any]]:
-        cursor = self.chats.find({}).sort("title", ASCENDING)
+    async def list_chats(self, include_hidden: bool = True) -> list[dict[str, Any]]:
+        query = {} if include_hidden else {"hidden_source_only": {"$ne": True}}
+        cursor = self.chats.find(query).sort("title", ASCENDING)
         return await cursor.to_list(length=500)
 
     async def get_chat(self, chat_id: int) -> dict[str, Any] | None:
@@ -364,6 +365,14 @@ class Database:
         await self.history_coll(chat_id).drop()
         await self.chats.delete_one({"chat_id": chat_id})
         await self.admins.update_many({"target_chat_id": chat_id}, {"$set": {"target_chat_id": None}})
+
+    async def mark_hidden_source(self, chat_id: int) -> None:
+        """Hides a channel from Targets/Upload pickers and stops it from being scheduled.
+        Used for channels only added so the bot can copy their existing posts elsewhere."""
+        await self.chats.update_one(
+            {"chat_id": chat_id},
+            {"$set": {"hidden_source_only": True, "is_active": False, "next_post_time": None, "updated_at": utcnow()}},
+        )
 
     async def wipe_all(self) -> None:
         chats = await self.list_chats()
@@ -582,7 +591,7 @@ class Database:
         }
 
     async def global_stats(self) -> dict[str, Any]:
-        chats = await self.list_chats()
+        chats = await self.list_chats(include_hidden=False)
         total_channels = sum(1 for c in chats if c.get("type") == "channel")
         total_groups = sum(1 for c in chats if c.get("type") != "channel")
         total_cycles_completed = sum(int(c.get("stats", {}).get("total_cycles_completed", 0)) for c in chats)
@@ -738,7 +747,7 @@ def dashboard_keyboard() -> InlineKeyboardMarkup:
 
 
 async def targets_keyboard() -> InlineKeyboardMarkup:
-    chats = await STATE.db.list_chats()
+    chats = await STATE.db.list_chats(include_hidden=False)
     rows: list[list[InlineKeyboardButton]] = []
     for chat in chats[:40]:
         icon = "📣" if chat.get("type") == "channel" else "👥"
@@ -748,7 +757,7 @@ async def targets_keyboard() -> InlineKeyboardMarkup:
 
 
 async def upload_targets_keyboard() -> InlineKeyboardMarkup:
-    chats = await STATE.db.list_chats()
+    chats = await STATE.db.list_chats(include_hidden=False)
     rows: list[list[InlineKeyboardButton]] = []
     for chat in chats[:40]:
         icon = "📣" if chat.get("type") == "channel" else "👥"
@@ -782,7 +791,7 @@ async def dashboard_text(admin_id: int) -> str:
     stats, target, chats = await asyncio.gather(
         STATE.db.global_stats(),
         get_target_chat(admin_id),
-        STATE.db.list_chats(),
+        STATE.db.list_chats(include_hidden=False),
     )
     return (
         "🌙 <b>Auto Posting Control Center</b>\n"
@@ -939,7 +948,8 @@ async def render_database_text() -> str:
     lines = []
     for chat in chats[:20]:
         post_count = await STATE.db.count_posts(chat["chat_id"])
-        lines.append(f"• <b>{html.escape(chat['title'])}</b> → <code>posts_{coll_suffix(chat['chat_id'])}</code> ({post_count})")
+        tag = " <i>(import source only — hidden)</i>" if chat.get("hidden_source_only") else ""
+        lines.append(f"• <b>{html.escape(chat['title'])}</b>{tag} → <code>posts_{coll_suffix(chat['chat_id'])}</code> ({post_count})")
     log_count = await STATE.db.logs.count_documents({})
     return (
         "🗃 <b>Database overview</b>\n"
@@ -1432,8 +1442,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await STATE.db.set_active_target(user.id, chat_id)
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("📝 Manual Upload", callback_data=f"up:manual:{chat_id}")],
-                [InlineKeyboardButton("📥 Import Range from Channel", callback_data=f"up:import:{chat_id}")],
+                [InlineKeyboardButton("📝 Manual", callback_data=f"up:manual:{chat_id}"), InlineKeyboardButton("📥 Import Range", callback_data=f"up:import:{chat_id}")],
                 [InlineKeyboardButton("⬅️ Back", callback_data="nav:upload")],
             ]
         )
@@ -1826,6 +1835,11 @@ async def private_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
         if source_chat_id is None:
             await message.reply_text("Forward a message from the source channel, or send its @username / ID. Send /cancel to abort.")
             return
+        existing_source_chat = await STATE.db.get_chat(source_chat_id)
+        if existing_source_chat and not existing_source_chat.get("hidden_source_only"):
+            existing_post_count = await STATE.db.count_posts(source_chat_id)
+            if existing_post_count == 0:
+                await STATE.db.mark_hidden_source(source_chat_id)
         await set_admin_meta(user.id, mode="import_from_link", mode_chat_id=target_chat_id, source_chat_id=source_chat_id)
         await message.reply_text(
             "🔗 Step 2 of 3 — Send the link (or plain message ID) of the FIRST post to import.\n"
@@ -1859,6 +1873,11 @@ async def private_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
             await message.reply_text(f"❌ Range too large ({total} posts). Please import in batches of 1000 or fewer, or /cancel.")
             return
         await clear_admin_mode(user.id)
+        existing_source_chat = await STATE.db.get_chat(source_chat_id)
+        if existing_source_chat and not existing_source_chat.get("hidden_source_only") and total > 0:
+            existing_post_count = await STATE.db.count_posts(source_chat_id)
+            if existing_post_count == 0:
+                await STATE.db.mark_hidden_source(source_chat_id)
         status = await message.reply_text(f"⏳ Queuing {total} post(s) for import…")
         for msg_id in range(lo, hi + 1):
             payload = {
