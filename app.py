@@ -17,6 +17,7 @@ from bson import ObjectId
 from bson import json_util
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, InputMediaVideo, Update
 from telegram.constants import ChatType
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
@@ -292,6 +293,12 @@ class Database:
         getattr(logger, level.lower(), logger.info)("%s | %s", event, payload)
 
     async def ensure_chat(self, chat_id: int, title: str, chat_type: str, username: str | None = None) -> dict[str, Any]:
+        try:
+            return await self._ensure_chat_once(chat_id, title, chat_type, username)
+        except DuplicateKeyError:
+            return await self._ensure_chat_once(chat_id, title, chat_type, username)
+
+    async def _ensure_chat_once(self, chat_id: int, title: str, chat_type: str, username: str | None = None) -> dict[str, Any]:
         now = utcnow()
         doc = await self.chats.find_one_and_update(
             {"chat_id": chat_id},
@@ -788,7 +795,7 @@ def dashboard_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📝 Posts", callback_data="nav:posts"), InlineKeyboardButton("📈 Stats", callback_data="nav:stats")],
             [InlineKeyboardButton("⚙️ Settings", callback_data="nav:settings"), InlineKeyboardButton("📜 Logs", callback_data="nav:logs")],
             [InlineKeyboardButton("🗃 Database", callback_data="nav:database"), InlineKeyboardButton("💾 Backup", callback_data="nav:backup")],
-            [InlineKeyboardButton("⬆️ Upload Mode", callback_data="nav:upload")],
+            [InlineKeyboardButton("➕ Add Channel/Group", callback_data="target:add"), InlineKeyboardButton("⬆️ Upload Mode", callback_data="nav:upload")],
         ]
     )
 
@@ -799,6 +806,7 @@ async def targets_keyboard() -> InlineKeyboardMarkup:
     for chat in chats[:40]:
         icon = "📣" if chat.get("type") == "channel" else "👥"
         rows.append([InlineKeyboardButton(f"{icon} {trim(chat['title'], 36)}", callback_data=f"chat:open:{chat['chat_id']}")])
+    rows.append([InlineKeyboardButton("➕ Add Channel/Group", callback_data="target:add")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="nav:dashboard")])
     return InlineKeyboardMarkup(rows)
 
@@ -1402,10 +1410,35 @@ async def register_current_chat(update: Update, context: ContextTypes.DEFAULT_TY
     await update.effective_message.reply_text(f"Registered: {saved['title']}")
 
 
+async def notify_admins(bot, text: str) -> None:
+    for admin_id in SETTINGS.admin_ids:
+        try:
+            await bot.send_message(admin_id, text, parse_mode="HTML")
+        except (BadRequest, Forbidden, NetworkError, TimedOut):
+            pass
+
+
 async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.my_chat_member.chat
-    if chat.type in (ChatType.CHANNEL, ChatType.GROUP, ChatType.SUPERGROUP):
-        await upsert_target_from_chat(chat)
+    change = update.my_chat_member
+    chat = change.chat
+    if chat.type not in (ChatType.CHANNEL, ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    new_status = change.new_chat_member.status
+    if new_status in ("left", "kicked"):
+        await STATE.db.log("info", "bot_removed_from_chat", chat_id=chat.id, status=new_status)
+        return
+    try:
+        saved = await upsert_target_from_chat(chat)
+    except Exception as exc:  # noqa: BLE001
+        await STATE.db.log("error", "register_chat_failed", chat_id=chat.id, error=str(exc))
+        await notify_admins(context.bot, f"❌ <b>{html.escape(chat.title or str(chat.id))}</b> register nahi ho paya: <code>{html.escape(str(exc))}</code>")
+        return
+    await STATE.db.log("info", "chat_registered", chat_id=chat.id, status=new_status)
+    await notify_admins(
+        context.bot,
+        f"✅ Registered: <b>{html.escape(saved['title'])}</b> ({'channel' if saved['type'] == 'channel' else 'group'})\n"
+        "Ab /start → 🧭 Targets me dikhega.",
+    )
 
 
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1526,6 +1559,17 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await _handle_callback_inner(update, context)
+    except BadRequest as exc:
+        # Tapping a button whose screen is already showing (e.g. Dashboard on Dashboard)
+        # makes Telegram reject the edit. That's harmless, so just ignore it.
+        if "message is not modified" in str(exc).lower():
+            return
+        raise
+
+
+async def _handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = query.from_user
     if not is_admin(user.id if user else None):
@@ -1607,6 +1651,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await clear_admin_mode(user.id)
         await STATE.db.admins.update_one({"admin_id": user.id}, {"$unset": {"upload_count": "", "upload_msg_id": ""}})
         await query.edit_message_text(f"✅ Upload finished — <b>{count}</b> post(s) added to {title}.", parse_mode="HTML")
+        return
+    if data == "target:add":
+        await set_admin_meta(user.id, mode="add_target")
+        await context.bot.send_message(
+            query.message.chat_id,
+            (
+                "➕ <b>Add Channel / Group</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "1. Pehle bot ko us channel/group me <b>admin</b> banao.\n"
+                "2. Phir yaha bhejo:\n"
+                "   • Channel ka koi bhi message <b>forward</b> karo, ya\n"
+                "   • <code>@username</code> bhejo, ya\n"
+                "   • numeric ID bhejo (jaise <code>-1001234567890</code>)\n\n"
+                "Group ke liye @username / ID bhejo, ya group me jaakar <code>/register</code> likho.\n"
+                "Cancel karne ke liye /cancel."
+            ),
+            parse_mode="HTML",
+        )
         return
     if data == "nav:logs":
         await query.edit_message_text(await render_logs_text(), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="nav:dashboard")]]), parse_mode="HTML")
@@ -2044,6 +2106,50 @@ async def private_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
         await clear_admin_mode(user.id)
         await message.reply_text(f"🔒 Force-sub gate set to {raw} ✅\nNew join requests will now be checked against this channel.")
         return
+    if mode == "add_target":
+        chat_ref: int | str | None = None
+        origin = getattr(message, "forward_origin", None)
+        if origin is not None:
+            origin_chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
+            if origin_chat is not None:
+                chat_ref = origin_chat.id
+        if chat_ref is None and getattr(message, "forward_from_chat", None):
+            chat_ref = message.forward_from_chat.id
+        if chat_ref is None and message.text:
+            raw = message.text.strip()
+            if "t.me/" in raw:
+                raw = raw.split("t.me/", 1)[1].split("/")[0].split("?")[0]
+            if raw.lstrip("-").isdigit():
+                chat_ref = int(raw)
+            else:
+                chat_ref = raw if raw.startswith("@") else f"@{raw}"
+        if chat_ref is None:
+            await message.reply_text("Channel ka message forward karo, ya @username / ID bhejo. /cancel se band karo.")
+            return
+        try:
+            chat_obj = await context.bot.get_chat(chat_ref)
+            member = await context.bot.get_chat_member(chat_obj.id, context.bot.id)
+        except (BadRequest, Forbidden) as exc:
+            await message.reply_text(f"❌ Chat access nahi mil raha: {exc}\nBot ko wahan admin banao, phir dobara bhejo (ya /cancel).")
+            return
+        if chat_obj.type not in (ChatType.CHANNEL, ChatType.GROUP, ChatType.SUPERGROUP):
+            await message.reply_text("❌ Ye channel ya group nahi hai. Dobara bhejo ya /cancel.")
+            return
+        if member.status in ("left", "kicked"):
+            await message.reply_text("❌ Bot is chat me member nahi hai. Pehle bot ko add/admin karo, phir dobara bhejo.")
+            return
+        if chat_obj.type == ChatType.CHANNEL and member.status not in ("administrator", "creator"):
+            await message.reply_text("❌ Channel me bot ko admin banana zaroori hai (Post messages permission ke saath). Phir dobara bhejo.")
+            return
+        saved = await upsert_target_from_chat(chat_obj)
+        await STATE.db.set_active_target(user.id, saved["chat_id"])
+        await clear_admin_mode(user.id)
+        await message.reply_text(
+            "✅ Added & selected!\n\n" + await render_chat_overview(saved["chat_id"]),
+            reply_markup=await chat_keyboard(saved["chat_id"]),
+            parse_mode="HTML",
+        )
+        return
     if mode == "bulk_upload":
         target_chat_id = int(admin_state.get("mode_chat_id"))
         target = await STATE.db.get_chat(target_chat_id)
@@ -2066,162 +2172,4 @@ async def private_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
             return
         payload = message_to_post_payload(message)
         await STATE.db.add_post(target_chat_id, payload)
-        await bump_upload_counter(user.id, context, message.chat_id, added=1)
-        return
-    if mode == "promo_text":
-        target_chat_id = int(admin_state.get("mode_chat_id"))
-        chat = await STATE.db.get_chat(target_chat_id)
-        title = chat.get("title", str(target_chat_id)) if chat else str(target_chat_id)
-        old_promo_id = chat.get("promo_message_id") if chat else None
-        if old_promo_id:
-            try:
-                await context.bot.unpin_chat_message(chat_id=target_chat_id, message_id=old_promo_id)
-            except (BadRequest, Forbidden):
-                pass
-        try:
-            sent = await context.bot.copy_message(chat_id=target_chat_id, from_chat_id=message.chat_id, message_id=message.message_id)
-            await context.bot.pin_chat_message(chat_id=target_chat_id, message_id=sent.message_id, disable_notification=True)
-        except (BadRequest, Forbidden) as exc:
-            await clear_admin_mode(user.id)
-            await message.reply_text(f"❌ Could not send/pin: {exc}")
-            return
-        await STATE.db.chats.update_one({"chat_id": target_chat_id}, {"$set": {"promo_message_id": sent.message_id, "updated_at": utcnow()}})
-        await clear_admin_mode(user.id)
-        await message.reply_text(f"📌 Prompt sent & pinned in {title} ✅")
-        return
-
-    target = await get_target_chat(user.id)
-    if not target:
-        await message.reply_text("Select a target from the dashboard first.")
-        return
-
-    if message.media_group_id and (message.photo or message.video):
-        await buffer_media_group_item(update, context, target)
-        return
-
-    if message.document and (message.document.file_name or "").lower().endswith((".json", ".jsonl", ".txt")):
-        posts = await parse_bulk_document(message, context)
-        inserted = await STATE.db.bulk_add_posts(target["chat_id"], posts)
-        await message.reply_text(f"Bulk import complete ✅\nInserted posts: {inserted}")
-        chat = await STATE.db.get_chat(target["chat_id"])
-        queue = chat.get("queue_state", {}).get("queue", [])
-        cursor = int(chat.get("queue_state", {}).get("cursor", 0))
-        if not queue or cursor >= len(queue):
-            await rebuild_and_ensure_schedule(target["chat_id"])
-        return
-
-    payload = message_to_post_payload(message)
-    await STATE.db.add_post(target["chat_id"], payload)
-    await message.reply_text(f"Saved to {target['title']} ✅\n{post_label(payload)}")
-    chat = await STATE.db.get_chat(target["chat_id"])
-    queue = chat.get("queue_state", {}).get("queue", [])
-    cursor = int(chat.get("queue_state", {}).get("cursor", 0))
-    if not queue or cursor >= len(queue):
-        await rebuild_and_ensure_schedule(target["chat_id"])
-
-
-async def any_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    if chat and chat.type in (ChatType.CHANNEL, ChatType.GROUP, ChatType.SUPERGROUP):
-        await upsert_target_from_chat(chat)
-
-
-async def auto_backup_tick(application: Application) -> None:
-    try:
-        payload = await STATE.db.backup_payload()
-        blob = json_util.dumps(payload, indent=2).encode("utf-8")
-        filename = f"autobackup-{utcnow().strftime('%Y%m%d-%H%M%S')}.json"
-        for admin_id in SETTINGS.admin_ids:
-            try:
-                await application.bot.send_document(
-                    admin_id,
-                    document=InputFile(io.BytesIO(blob), filename=filename),
-                    caption=f"🗓 Automatic daily backup ✅\nChats: {len(payload.get('chats', []))}",
-                )
-            except (BadRequest, Forbidden):
-                pass  # admin hasn't started the bot privately, or blocked it
-        await STATE.db.log("info", "auto_backup_sent", admins=len(SETTINGS.admin_ids))
-    except Exception as exc:  # noqa: BLE001 - never let a backup failure kill the scheduler
-        await STATE.db.log("error", "auto_backup_failed", error=str(exc))
-
-
-async def on_startup(application: Application) -> None:
-    global BOT_USERNAME
-    await STATE.db.init()
-    me = await application.bot.get_me()
-    BOT_USERNAME = me.username or ""
-    STATE.scheduler.start(paused=False)
-    STATE.scheduler.add_job(scheduler_tick, "interval", seconds=SETTINGS.scan_interval_seconds, args=[application], max_instances=1, coalesce=True)
-    STATE.scheduler.add_job(auto_backup_tick, "cron", hour=3, minute=0, args=[application], max_instances=1, coalesce=True, id="auto_backup")
-    await STATE.db.log("info", "startup_complete", bot_username=BOT_USERNAME)
-
-
-async def on_shutdown(application: Application) -> None:
-    if STATE.scheduler.running:
-        STATE.scheduler.shutdown(wait=False)
-    await STATE.db.log("info", "shutdown_complete")
-
-
-class _HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, format: str, *args: Any) -> None:  # silence default access logs
-        pass
-
-
-def start_health_server() -> None:
-    port = int(os.getenv("PORT", "8080"))
-    server = HTTPServer(("0.0.0.0", port), _HealthCheckHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    logging.getLogger(__name__).info("health_check_server_started", extra={"port": port})
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Unhandled exception while processing update", exc_info=context.error)
-    try:
-        await STATE.db.log("error", "unhandled_exception", error=str(context.error))
-    except Exception:  # noqa: BLE001 - never let error logging itself crash the handler
-        pass
-    if isinstance(update, Update) and update.effective_chat:
-        try:
-            await context.bot.send_message(
-                update.effective_chat.id,
-                f"⚠️ Something went wrong: <code>{html.escape(str(context.error))}</code>\nSend /start to reset.",
-                parse_mode="HTML",
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def build_application() -> Application:
-    app = Application.builder().token(SETTINGS.bot_token).build()
-    app.post_init = on_startup
-    app.post_shutdown = on_shutdown
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("register", register_current_chat))
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
-    app.add_handler(CallbackQueryHandler(handle_reaction, pattern=r"^react:\d+$"))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_handler(ChatJoinRequestHandler(handle_join_request))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, private_admin_message))
-    app.add_handler(MessageHandler(~filters.ChatType.PRIVATE & ~filters.COMMAND, any_chat_message))
-    app.add_error_handler(error_handler)
-    return app
-
-
-def main() -> None:
-    start_health_server()
-    app = build_application()
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
-
-
-if __name__ == "__main__":
-    main()
+        await bump
