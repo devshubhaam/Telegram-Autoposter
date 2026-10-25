@@ -65,6 +65,7 @@ from .utils import (
     REACTION_EMOJIS,
     chat_opts,
     format_dt,
+    parse_message_link,
     parse_post_markup,
     parse_schedule_text,
     utcnow,
@@ -80,7 +81,7 @@ IGNORABLE_BADREQUEST = (
     "message to delete not found",
 )
 NOISY_ERRORS = (Conflict, NetworkError, TimedOut, RetryAfter)
-KNOWN_MODES = {"await_password", "restore_backup", "edit_schedule", "force_sub_channel", "footer_text", "add_target", "bulk_upload", "promo_text"}
+KNOWN_MODES = {"await_password", "restore_backup", "edit_schedule", "force_sub_channel", "footer_text", "import_first", "import_last", "add_target", "bulk_upload", "promo_text"}
 MAX_FOOTER_LEN = 400
 MAX_BACKUP_BYTES = 40 * 1024 * 1024
 BACKGROUND_TASKS: set[asyncio.Task] = set()
@@ -449,6 +450,18 @@ async def route_callback(cb: Cb, data: str) -> None:
         elif action == "change":
             await clear_admin_mode(user_id)
             await cb.edit("⬆️ <b>Upload posts</b>\nWhich target do you want to upload to?", await upload_picker_keyboard())
+        elif action == "import":
+            state = await admin_doc(user_id)
+            if state.get("mode") != "bulk_upload":
+                await cb.ack("Start upload mode first.", alert=True)
+                return
+            await set_admin_meta(user_id, mode="import_first")
+            await cb.send(
+                "📥 <b>Import range — step 1 of 2</b>\n━━━━━━━━━━━━━━━━━━\n"
+                "Bot ko source channel me <b>admin</b> banao (private channel ho to bhi chalega). "
+                "Phir us range ki <b>pehli post ka link</b> bhejo, jaise <code>https://t.me/c/1234567890/120</code> ya <code>https://t.me/channelname/120</code>.",
+                cancel_keyboard(),
+            )
         elif action == "finish":
             summary = await finish_upload(user_id)
             await cb.edit(summary or "Upload mode is not active.", back_to_dashboard())
@@ -1163,6 +1176,76 @@ async def mode_add_target(update: Update, context: ContextTypes.DEFAULT_TYPE, st
     )
 
 
+IMPORT_LIMIT = 5000
+
+
+async def mode_import_first(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict[str, Any]) -> None:
+    message, user = update.effective_message, update.effective_user
+    parsed = parse_message_link(message.text or "")
+    if not parsed or parsed[0] is None:
+        await message.reply_text("Link samajh nahi aaya. Aisa link bhejo: https://t.me/c/1234567890/120 (ya /cancel).")
+        return
+    ref, first_id = parsed
+    try:
+        source = await context.bot.get_chat(ref)
+        member = await context.bot.get_chat_member(source.id, context.bot.id)
+    except TelegramError as exc:
+        await message.reply_text(f"❌ Source channel access nahi mil raha: {exc}\nBot ko wahan admin banao aur link dobara bhejo (ya /cancel).")
+        return
+    if member.status in ("left", "kicked"):
+        await message.reply_text("❌ Bot us channel me member nahi hai. Pehle add/admin karo, phir link bhejo.")
+        return
+    await set_admin_meta(user.id, mode="import_last", source_chat_id=source.id, from_message_id=first_id)
+    await message.reply_text(f"✅ Source: {source.title or source.id}\n\n📥 Step 2 of 2 — ab range ki <b>last post ka link</b> bhejo.", parse_mode="HTML", reply_markup=cancel_keyboard())
+
+
+async def mode_import_last(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict[str, Any]) -> None:
+    message, user = update.effective_message, update.effective_user
+    parsed = parse_message_link(message.text or "")
+    source_chat_id = int(state["source_chat_id"])
+    if not parsed:
+        await message.reply_text("Link samajh nahi aaya. Last post ka link bhejo (ya /cancel).")
+        return
+    ref, last_id = parsed
+    if ref is not None:
+        try:
+            same = (await context.bot.get_chat(ref)).id == source_chat_id
+        except TelegramError:
+            same = False
+        if not same:
+            await message.reply_text("❌ Ye link doosre channel ka hai. Pehle wale hi channel ka link bhejo.")
+            return
+    lo, hi = sorted((int(state["from_message_id"]), last_id))
+    total = hi - lo + 1
+    if total > IMPORT_LIMIT:
+        await message.reply_text(f"❌ Range bahut bada hai ({total}). Ek baar me {IMPORT_LIMIT} tak import karo, ya /cancel.")
+        return
+    target_chat_id = int(state["mode_chat_id"])
+    target = await STATE.db.get_chat(target_chat_id)
+    if not target:
+        await clear_admin_mode(user.id)
+        await message.reply_text("❌ Target channel ab exist nahi karta.")
+        return
+    posts = [
+        {"media_type": "copy", "source_chat_id": source_chat_id, "source_message_id": mid, "fingerprint": f"c:{source_chat_id}:{mid}",
+         "caption": None, "silent": False, "protect_content": False, "buttons": []}
+        for mid in range(lo, hi + 1)
+    ]
+    inserted, dups = await STATE.db.bulk_add_posts(target_chat_id, posts, chat_opts(target)["dedupe"])
+    await after_posts_added(target_chat_id)
+    await STATE.db.admins.update_one({"admin_id": user.id}, {"$unset": {"source_chat_id": "", "from_message_id": ""}})
+    await set_admin_meta(user.id, mode="bulk_upload", mode_chat_id=target_chat_id)  # back to upload mode
+    await bump_upload(user.id, context, added=inserted, dups=dups)
+    fresh = await STATE.db.get_chat(target_chat_id)
+    await message.reply_text(
+        f"✅ Import queued into <b>{esc(target['title'])}</b>\n📦 Posts added: <b>{inserted}</b>"
+        + (f"\n🧬 Already imported: {dups}" if dups else "")
+        + f"\n⏰ Next run: <b>{esc(format_dt(fresh.get('next_post_time')))}</b>\n\n"
+        "Deleted/service messages range me ho to wo apne aap skip ho jate hain. Aur posts bhej sakte ho ya ✅ Finish dabao.",
+        parse_mode="HTML",
+    )
+
+
 async def mode_bulk_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict[str, Any]) -> None:
     message, user = update.effective_message, update.effective_user
     target = await STATE.db.get_chat(int(state["mode_chat_id"]))
@@ -1204,6 +1287,8 @@ MODE_HANDLERS = {
     "restore_backup": mode_restore,
     "edit_schedule": mode_edit_schedule,
     "footer_text": mode_footer,
+    "import_first": mode_import_first,
+    "import_last": mode_import_last,
     "force_sub_channel": mode_force_sub,
     "add_target": mode_add_target,
     "bulk_upload": mode_bulk_upload,
