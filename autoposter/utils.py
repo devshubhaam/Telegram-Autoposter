@@ -319,3 +319,20 @@ def compose_text(body: str | None, footer: str | None, skip_footer: bool = False
 
 def coll_suffix(chat_id: int) -> str:
     return f"m_{abs(chat_id)}" if chat_id < 0 else f"p_{chat_id}"
+
+
+def parse_message_link(value: str) -> tuple[int | str | None, int] | None:
+    """'https://t.me/c/1234567890/55' -> (-1001234567890, 55); 'https://t.me/name/55' -> ('@name', 55);
+    plain '55' -> (None, 55). Returns None if unreadable."""
+    raw = (value or "").strip().split("?", 1)[0].rstrip("/")
+    if not raw:
+        return None
+    if raw.isdigit():
+        return None, int(raw)
+    match = re.search(r"(?:t|telegram)\.me/c/(\d+)/(?:\d+/)?(\d+)$", raw)
+    if match:
+        return int(f"-100{match.group(1)}"), int(match.group(2))
+    match = re.search(r"(?:t|telegram)\.me/([A-Za-z][\w]{3,})/(?:\d+/)?(\d+)$", raw)
+    if match:
+        return f"@{match.group(1)}", int(match.group(2))
+    return None
