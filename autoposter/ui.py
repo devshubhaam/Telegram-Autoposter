@@ -537,7 +537,7 @@ HELP_TEXT = (
 # Upload mode
 # --------------------------------------------------------------------------- #
 def upload_keyboard() -> Markup:
-    return Markup([[b("✅ Finish upload", "up:finish"), b("🔄 Change target", "up:change")]])
+    return Markup([[b("📥 Import range from channel", "up:import")], [b("✅ Finish upload", "up:finish"), b("🔄 Change target", "up:change")]])
 
 
 def upload_text(title: str, added: int, dups: int, bad: int) -> str:
@@ -550,7 +550,7 @@ def upload_text(title: str, added: int, dups: int, bad: int) -> str:
         f"⬆️ <b>Upload mode → {esc(title)}</b>\n"
         f"{SEP}\n"
         "Send your posts now: text, photo, video, GIF, document, audio, voice, sticker, album, poll, "
-        "or a .json/.jsonl/.txt bulk file.\n"
+        "or a .json/.jsonl/.txt bulk file.\nOr tap 📥 Import range to copy a range of posts from another channel.\n"
         f"Posts added: <b>{added}</b>{extra}"
     )
 
