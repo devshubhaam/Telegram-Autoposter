@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: telegram-auto-posting-bot
+    runtime: docker
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: TIMEZONE
+        value: Asia/Kolkata
