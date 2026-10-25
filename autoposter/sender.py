@@ -269,11 +269,11 @@ async def _pause_chat(bot, chat_id: int, title: str, reason: str, error: str | N
     await notify_admins(bot, f"⏸ <b>{html.escape(title)}</b> paused\n{html.escape(reason)}")
 
 
-async def _post_failed(bot, chat_id: int, title: str, post_id: str, exc: Exception) -> None:
+async def _post_failed(bot, chat_id: int, title: str, post_id: str, exc: Exception, immediate: bool = False) -> None:
     fails = await STATE.db.record_post_failure(chat_id, post_id, f"{type(exc).__name__}: {exc}")
     await STATE.db.chats.update_one({"chat_id": chat_id}, {"$set": {"last_error": f"{type(exc).__name__}: {exc}"[:300], "updated_at": utcnow()}})
     await STATE.db.log("warning", "post_skipped", chat_id=chat_id, post_id=post_id, error=str(exc), fail_count=fails)
-    if fails >= QUARANTINE_AFTER:
+    if fails >= QUARANTINE_AFTER or immediate:
         await STATE.db.quarantine_post(chat_id, post_id, str(exc))
         await notify_admins(
             bot,
@@ -336,7 +336,7 @@ async def process_chat_batch(bot, chat_id: int, manual: bool = False) -> int:
                         await _pause_chat(bot, chat_id, title, f"Telegram refused to post: {exc}", error=f"BadRequest: {exc}")
                         stopped = True
                         break
-                    await _post_failed(bot, chat_id, title, post_id, exc)
+                    await _post_failed(bot, chat_id, title, post_id, exc, immediate=post.get("media_type") in COPY_TYPES and ("not found" in str(exc).lower() or "can't be copied" in str(exc).lower()))
                     failures += 1
                 except Forbidden as exc:
                     if post.get("media_type") in COPY_TYPES:
