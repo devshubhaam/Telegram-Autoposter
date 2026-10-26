@@ -23,7 +23,7 @@ from telegram.ext import (
 from autoposter import __version__, handlers
 from autoposter.config import SETTINGS, TZ, logger
 from autoposter.database import Database
-from autoposter.jobs import daily_job, housekeeping_tick, scheduler_tick
+from autoposter.jobs import archive_tick, daily_job, housekeeping_tick, scheduler_tick
 from autoposter.state import STATE
 
 COMMANDS = [
@@ -62,6 +62,8 @@ async def on_startup(application: Application) -> None:
     job_kwargs = {"max_instances": 1, "coalesce": True, "misfire_grace_time": 60}
     jq.run_repeating(scheduler_tick, interval=SETTINGS.scan_interval_seconds, first=5, name="scheduler_tick", job_kwargs=job_kwargs)
     jq.run_repeating(housekeeping_tick, interval=60, first=20, name="housekeeping", job_kwargs=job_kwargs)
+    if SETTINGS.vault_chat_id:
+        jq.run_repeating(archive_tick, interval=25, first=30, name="archive", job_kwargs=job_kwargs)
     jq.run_daily(daily_job, time=time(3, 0, tzinfo=TZ), name="daily", job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 3600})
     await STATE.db.log("info", "startup_complete", bot_username=STATE.bot_username, version=__version__)
 
