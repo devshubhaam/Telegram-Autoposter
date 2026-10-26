@@ -72,6 +72,7 @@ class Settings:
     retry_base_seconds: float
     post_gap_seconds: float
     log_retention_days: int
+    vault_chat_id: int | None = None
     admin_password: str | None = None
     password_timeout_seconds: int = 300
 
@@ -122,6 +123,7 @@ class Settings:
             retry_base_seconds=_env_float("RETRY_BASE_SECONDS", 2.0, 0.0),
             post_gap_seconds=_env_float("POST_GAP_SECONDS", 1.0, 0.0),
             log_retention_days=_env_int("LOG_RETENTION_DAYS", 14, 1),
+            vault_chat_id=_env_int("VAULT_CHAT_ID", 0) or None,
             admin_password=(os.getenv("ADMIN_PASSWORD", "").strip() or None),
             password_timeout_seconds=_env_int("PASSWORD_TIMEOUT_SECONDS", 300, 30),
         )
