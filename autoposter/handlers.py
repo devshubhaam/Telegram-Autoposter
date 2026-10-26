@@ -1231,7 +1231,20 @@ async def mode_import_last(update: Update, context: ContextTypes.DEFAULT_TYPE, s
          "caption": None, "silent": False, "protect_content": False, "buttons": []}
         for mid in range(lo, hi + 1)
     ]
+    vault_note = ""
+    if SETTINGS.vault_chat_id:
+        try:
+            await context.bot.get_chat_member(SETTINGS.vault_chat_id, context.bot.id)
+            for post in posts:
+                post["archive_pending"] = True
+            vault_note = "\n🗄 Saving a safe copy of each post in your vault in the background, so deleting them from the source later won't break anything."
+        except TelegramError:
+            vault_note = "\n⚠️ VAULT_CHAT_ID set hai par bot wahan admin nahi — backup copy nahi banegi. Source se post delete hui to wo skip ho jayegi."
+    else:
+        vault_note = "\n⚠️ Source se post delete hui to wo skip ho jayegi. Safe rakhne ke liye VAULT_CHAT_ID set karo."
     inserted, dups = await STATE.db.bulk_add_posts(target_chat_id, posts, chat_opts(target)["dedupe"])
+    if inserted and vault_note.startswith("\n🗄"):
+        await STATE.db.chats.update_one({"chat_id": target_chat_id}, {"$set": {"archiving": True}})
     await after_posts_added(target_chat_id)
     await STATE.db.admins.update_one({"admin_id": user.id}, {"$unset": {"source_chat_id": "", "from_message_id": ""}})
     await set_admin_meta(user.id, mode="bulk_upload", mode_chat_id=target_chat_id)  # back to upload mode
@@ -1241,7 +1254,7 @@ async def mode_import_last(update: Update, context: ContextTypes.DEFAULT_TYPE, s
         f"✅ Import queued into <b>{esc(target['title'])}</b>\n📦 Posts added: <b>{inserted}</b>"
         + (f"\n🧬 Already imported: {dups}" if dups else "")
         + f"\n⏰ Next run: <b>{esc(format_dt(fresh.get('next_post_time')))}</b>\n\n"
-        "Deleted/service messages range me ho to wo apne aap skip ho jate hain. Aur posts bhej sakte ho ya ✅ Finish dabao.",
+        "Deleted/service messages range me ho to wo apne aap skip ho jate hain." + vault_note + "\n\nAur posts bhej sakte ho ya ✅ Finish dabao.",
         parse_mode="HTML",
     )
 
